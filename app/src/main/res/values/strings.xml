@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">UNTOUCH</string>
+    <string name="accessibility_service_label">UNTOUCH Protection Engine</string>
+    <string name="accessibility_service_description">Monitors foreground app launches locally to block prohibited applications while Strict Mode is active. No data ever leaves your device.</string>
+    <string name="device_admin_description">Adds tamper resistance by preventing accidental uninstallation of UNTOUCH.</string>
+</resources>
