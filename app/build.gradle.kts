@@ -13,8 +13,20 @@ android {
         applicationId = "com.untouch.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 2
-        versionName = "2.0.0"
+        versionCode = 3
+        versionName = "2.1.0"
+    }
+
+    // Stable debug signing key committed to the repo so successive CI builds
+    // can update the app in place instead of forcing an uninstall (which would
+    // wipe the encrypted PIN/config). This is a personal, sideload-only key.
+    signingConfigs {
+        getByName("debug") {
+            storeFile = rootProject.file("untouch-debug.keystore")
+            storePassword = "untouchdebug"
+            keyAlias = "untouch"
+            keyPassword = "untouchdebug"
+        }
     }
 
     buildTypes {

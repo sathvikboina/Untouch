@@ -23,6 +23,10 @@ gradle assembleDebug
 
 The APK lands at `app/build/outputs/apk/debug/app-debug.apk`.
 
+Debug builds are signed with the committed `untouch-debug.keystore` so that
+successive builds update in place rather than requiring an uninstall (which
+would wipe the encrypted PIN and blocked-app list).
+
 ## Honest limits
 
 On a stock, non-rooted phone without Device Owner provisioning, an app cannot
