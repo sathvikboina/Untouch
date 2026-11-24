@@ -23,6 +23,12 @@ data class PermissionStatus(
     val batteryOptimizationIgnored: Boolean,
     val notificationsGranted: Boolean
 ) {
+    /**
+     * Accessibility enforces blocking. "Display over other apps" is required
+     * because Android only permits an app to launch an activity from the
+     * background (the BlockedActivity screen) when it holds
+     * SYSTEM_ALERT_WINDOW. The permission is not used to draw an overlay.
+     */
     val coreProtectionReady: Boolean
         get() = accessibilityEnabled && overlayGranted
 }

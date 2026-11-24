@@ -66,6 +66,7 @@ class MainActivity : ComponentActivity() {
                             }
                         )
                         Screen.PIN_SETUP -> PinSetupScreen(
+                            isBusy = state.isAuthenticating,
                             onPinConfirmed = { viewModel.savePinAndFinishOnboarding(it) }
                         )
                         Screen.DASHBOARD -> DashboardScreen(
@@ -94,6 +95,7 @@ class MainActivity : ComponentActivity() {
                         )
                         Screen.ADMIN_AUTH -> AdminAuthScreen(
                             error = state.authError,
+                            isBusy = state.isAuthenticating,
                             onSubmit = { viewModel.submitAdminPin(it) },
                             onCancel = { viewModel.navigateTo(Screen.DASHBOARD) }
                         )
@@ -199,7 +201,7 @@ private fun AppSelectionScreen(
 }
 
 @Composable
-private fun PinSetupScreen(onPinConfirmed: (String) -> Unit) {
+private fun PinSetupScreen(isBusy: Boolean, onPinConfirmed: (String) -> Unit) {
     var pin by remember { mutableStateOf("") }
     var confirmPin by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
@@ -244,10 +246,11 @@ private fun PinSetupScreen(onPinConfirmed: (String) -> Unit) {
                     else -> onPinConfirmed(pin)
                 }
             },
+            enabled = !isBusy,
             modifier = Modifier.fillMaxWidth().height(52.dp),
             colors = ButtonDefaults.buttonColors(containerColor = AccentWhite, contentColor = PureBlack)
         ) {
-            Text("SAVE ENCRYPTED PIN", fontWeight = FontWeight.Bold)
+            Text(if (isBusy) "SAVING…" else "SAVE ENCRYPTED PIN", fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -428,6 +431,13 @@ private fun PermissionsScreen(state: MainUiState, onRefresh: () -> Unit, onConti
     val context = LocalContext.current
     val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { onRefresh() }
 
+    // Some OEM skins do not expose every settings screen; never crash on a
+    // missing activity, just fall back to the top-level Settings app.
+    fun openSettings(intent: Intent) {
+        val opened = runCatching { context.startActivity(intent) }.isSuccess
+        if (!opened) runCatching { context.startActivity(Intent(Settings.ACTION_SETTINGS)) }
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("PERMISSIONS & PROTECTION", fontSize = 20.sp, fontWeight = FontWeight.Bold)
         Text(
@@ -435,13 +445,13 @@ private fun PermissionsScreen(state: MainUiState, onRefresh: () -> Unit, onConti
             color = TextSecondary, fontSize = 13.sp
         )
         PermissionRow("Accessibility Service (Required)", state.permissionStatus.accessibilityEnabled) {
-            context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            openSettings(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
         PermissionRow("Display Over Other Apps (Required)", state.permissionStatus.overlayGranted) {
-            context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}")))
+            openSettings(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}")))
         }
         PermissionRow("Usage Access (Alert Monitor)", state.permissionStatus.usageStatsGranted) {
-            context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+            openSettings(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
         }
         PermissionRow("Device Admin (Uninstall Friction)", state.permissionStatus.deviceAdminActive) {
             val comp = ComponentName(context, UntouchDeviceAdminReceiver::class.java)
@@ -449,10 +459,10 @@ private fun PermissionsScreen(state: MainUiState, onRefresh: () -> Unit, onConti
                 putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, comp)
                 putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Prevents accidental uninstallation of UNTOUCH.")
             }
-            context.startActivity(intent)
+            openSettings(intent)
         }
         PermissionRow("Ignore Battery Optimization", state.permissionStatus.batteryOptimizationIgnored) {
-            context.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}")))
+            openSettings(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}")))
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             PermissionRow("Notifications (Tamper Alerts)", state.permissionStatus.notificationsGranted) {
@@ -493,7 +503,7 @@ private fun PermissionRow(title: String, granted: Boolean, onClick: () -> Unit) 
 }
 
 @Composable
-private fun AdminAuthScreen(error: String?, onSubmit: (String) -> Unit, onCancel: () -> Unit) {
+private fun AdminAuthScreen(error: String?, isBusy: Boolean, onSubmit: (String) -> Unit, onCancel: () -> Unit) {
     var pin by remember { mutableStateOf("") }
     Column(modifier = Modifier.fillMaxSize().padding(28.dp), verticalArrangement = Arrangement.Center) {
         Text("ADMINISTRATOR PIN", fontSize = 22.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
@@ -516,11 +526,11 @@ private fun AdminAuthScreen(error: String?, onSubmit: (String) -> Unit, onCancel
         Spacer(modifier = Modifier.height(24.dp))
         Button(
             onClick = { onSubmit(pin) },
-            enabled = pin.isNotEmpty(),
+            enabled = pin.isNotEmpty() && !isBusy,
             modifier = Modifier.fillMaxWidth().height(52.dp),
             colors = ButtonDefaults.buttonColors(containerColor = AccentWhite, contentColor = PureBlack)
         ) {
-            Text("VERIFY PIN", fontWeight = FontWeight.Bold)
+            Text(if (isBusy) "VERIFYING…" else "VERIFY PIN", fontWeight = FontWeight.Bold)
         }
         Spacer(modifier = Modifier.height(12.dp))
         TextButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {

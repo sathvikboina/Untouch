@@ -14,6 +14,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -35,7 +36,16 @@ class BlockedActivity : ComponentActivity() {
 
         setContent {
             UntouchTheme {
-                BlockedScreen(onReturnHome = { goHome() })
+                val blockedPackage = intent.getStringExtra(EXTRA_BLOCKED_PACKAGE)
+                val appLabel = remember(blockedPackage) {
+                    blockedPackage?.let { pkg ->
+                        runCatching {
+                            val pm = packageManager
+                            pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+                        }.getOrNull()
+                    }
+                }
+                BlockedScreen(appLabel = appLabel, onReturnHome = { goHome() })
             }
         }
     }
@@ -55,7 +65,7 @@ class BlockedActivity : ComponentActivity() {
 }
 
 @Composable
-private fun BlockedScreen(onReturnHome: () -> Unit) {
+private fun BlockedScreen(appLabel: String?, onReturnHome: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -80,7 +90,8 @@ private fun BlockedScreen(onReturnHome: () -> Unit) {
         )
         Spacer(modifier = Modifier.height(12.dp))
         Text(
-            text = "This application is locked under Strict Mode.\nThere is no temporary unlock or snooze.",
+            text = if (appLabel != null) "$appLabel is locked under Strict Mode.\nThere is no temporary unlock or snooze."
+            else "This application is locked under Strict Mode.\nThere is no temporary unlock or snooze.",
             color = TextSecondary,
             fontSize = 15.sp,
             textAlign = TextAlign.Center,

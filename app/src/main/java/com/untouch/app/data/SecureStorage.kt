@@ -24,25 +24,43 @@ data class UntouchConfig(
     val blockedAttemptCount: Int
 )
 
-class SecureStorage(context: Context) {
+/**
+ * Process-wide encrypted settings store.
+ *
+ * A single instance is shared by the UI, services and receivers so the
+ * Keystore key and the decrypted config are cached in memory. Without both
+ * caches the Accessibility Service would perform several Keystore operations
+ * on every window change.
+ */
+class SecureStorage private constructor(context: Context) {
 
-    private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    /** Immutable snapshot; invalidated/updated on every write. Guarded by [synchronized]. */
+    private var cachedConfig: UntouchConfig? = null
 
     private fun getOrCreateKey(): SecretKey {
-        val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
-        (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
-
-        val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE_PROVIDER)
-        val spec = KeyGenParameterSpec.Builder(
-            KEY_ALIAS,
-            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-        )
-            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-            .setKeySize(256)
-            .build()
-        keyGenerator.init(spec)
-        return keyGenerator.generateKey()
+        cachedKey?.let { return it }
+        synchronized(KEY_LOCK) {
+            cachedKey?.let { return it }
+            val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
+            val existing = keyStore.getKey(KEY_ALIAS, null) as? SecretKey
+            val key = existing ?: run {
+                val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE_PROVIDER)
+                val spec = KeyGenParameterSpec.Builder(
+                    KEY_ALIAS,
+                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                )
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .setKeySize(256)
+                    .build()
+                keyGenerator.init(spec)
+                keyGenerator.generateKey()
+            }
+            cachedKey = key
+            return key
+        }
     }
 
     private fun encrypt(plaintext: String): String {
@@ -86,7 +104,10 @@ class SecureStorage(context: Context) {
         }
     }
 
+    @Synchronized
     fun readConfig(): StorageResult<UntouchConfig> {
+        cachedConfig?.let { return StorageResult.Success(it) }
+
         val onboarding = when (val r = readString(KEY_ONBOARDING)) {
             is StorageResult.Error -> return r
             is StorageResult.Success -> r.value == "true"
@@ -107,36 +128,61 @@ class SecureStorage(context: Context) {
             is StorageResult.Error -> return r
             is StorageResult.Success -> r.value?.toIntOrNull() ?: 0
         }
-        return StorageResult.Success(
-            UntouchConfig(
-                isOnboardingComplete = onboarding,
-                blockedPackages = blocked,
-                isStrictModeActive = strict,
-                strictModeStartTimeMillis = strictStart,
-                blockedAttemptCount = attempts
-            )
+        val config = UntouchConfig(
+            isOnboardingComplete = onboarding,
+            blockedPackages = blocked,
+            isStrictModeActive = strict,
+            strictModeStartTimeMillis = strictStart,
+            blockedAttemptCount = attempts
         )
+        cachedConfig = config
+        return StorageResult.Success(config)
     }
 
-    fun setOnboardingComplete(complete: Boolean): StorageResult<Unit> =
-        writeString(KEY_ONBOARDING, complete.toString())
+    @Synchronized
+    fun setOnboardingComplete(complete: Boolean): StorageResult<Unit> {
+        val result = writeString(KEY_ONBOARDING, complete.toString())
+        if (result is StorageResult.Success) {
+            cachedConfig = cachedConfig?.copy(isOnboardingComplete = complete)
+        }
+        return result
+    }
 
-    fun setBlockedPackages(packages: Set<String>): StorageResult<Unit> =
-        writeString(KEY_BLOCKED_PACKAGES, packages.joinToString("\n"))
+    @Synchronized
+    fun setBlockedPackages(packages: Set<String>): StorageResult<Unit> {
+        val result = writeString(KEY_BLOCKED_PACKAGES, packages.joinToString("\n"))
+        if (result is StorageResult.Success) {
+            cachedConfig = cachedConfig?.copy(blockedPackages = packages)
+        }
+        return result
+    }
 
+    @Synchronized
     fun setStrictModeActive(active: Boolean): StorageResult<Unit> {
         val r1 = writeString(KEY_STRICT_MODE, active.toString())
         if (r1 is StorageResult.Error) return r1
         val startMillis = if (active) System.currentTimeMillis() else 0L
-        return writeString(KEY_STRICT_START, startMillis.toString())
+        val r2 = writeString(KEY_STRICT_START, startMillis.toString())
+        if (r2 is StorageResult.Error) return r2
+        cachedConfig = cachedConfig?.copy(
+            isStrictModeActive = active,
+            strictModeStartTimeMillis = startMillis
+        )
+        return StorageResult.Success(Unit)
     }
 
+    @Synchronized
     fun incrementBlockedAttempts(): StorageResult<Unit> {
-        val current = when (val r = readString(KEY_BLOCKED_COUNT)) {
+        val current = cachedConfig?.blockedAttemptCount ?: when (val r = readString(KEY_BLOCKED_COUNT)) {
             is StorageResult.Error -> return r
             is StorageResult.Success -> r.value?.toIntOrNull() ?: 0
         }
-        return writeString(KEY_BLOCKED_COUNT, (current + 1).toString())
+        val next = current + 1
+        val result = writeString(KEY_BLOCKED_COUNT, next.toString())
+        if (result is StorageResult.Success) {
+            cachedConfig = cachedConfig?.copy(blockedAttemptCount = next)
+        }
+        return result
     }
 
     fun readPinHash(): StorageResult<String?> = readString(KEY_PIN_HASH)
@@ -172,15 +218,22 @@ class SecureStorage(context: Context) {
     fun writeLockoutUntilMillis(untilMillis: Long): StorageResult<Unit> =
         writeString(KEY_LOCKOUT_UNTIL, untilMillis.toString())
 
+    @Synchronized
     fun resetCorruptedVault() {
-        prefs.edit().clear().apply()
-        try {
-            val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
-            if (keyStore.containsAlias(KEY_ALIAS)) {
-                keyStore.deleteEntry(KEY_ALIAS)
+        prefs.edit().clear().commit()
+        cachedConfig = null
+        synchronized(KEY_LOCK) {
+            // Cached key belongs to the deleted Keystore entry; drop it so the
+            // next write generates a fresh key.
+            cachedKey = null
+            try {
+                val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
+                if (keyStore.containsAlias(KEY_ALIAS)) {
+                    keyStore.deleteEntry(KEY_ALIAS)
+                }
+            } catch (_: Exception) {
+                // Keystore entry already absent or inaccessible
             }
-        } catch (_: Exception) {
-            // Keystore entry already absent or inaccessible
         }
     }
 
@@ -201,5 +254,21 @@ class SecureStorage(context: Context) {
         private const val KEY_FAILED_ATTEMPTS = "k_failed_attempts"
         private const val KEY_LOCKOUT_UNTIL = "k_lockout_until"
         private const val KEY_BLOCKED_COUNT = "k_blocked_count"
+
+        private val KEY_LOCK = Any()
+
+        @Volatile
+        private var cachedKey: SecretKey? = null
+
+        @Volatile
+        private var instance: SecureStorage? = null
+
+        fun get(context: Context): SecureStorage {
+            instance?.let { return it }
+            synchronized(this) {
+                instance?.let { return it }
+                return SecureStorage(context.applicationContext).also { instance = it }
+            }
+        }
     }
 }

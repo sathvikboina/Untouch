@@ -13,7 +13,7 @@ class PackageEventReceiver : BroadcastReceiver() {
         if (action != Intent.ACTION_PACKAGE_ADDED && action != Intent.ACTION_PACKAGE_REPLACED) return
 
         val installedPackage = intent.data?.schemeSpecificPart ?: return
-        val storage = SecureStorage(context)
+        val storage = SecureStorage.get(context)
         val config = when (val res = storage.readConfig()) {
             is StorageResult.Success -> res.value
             is StorageResult.Error -> return

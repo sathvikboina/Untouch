@@ -11,7 +11,7 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action ?: return
         if (action == Intent.ACTION_BOOT_COMPLETED || action == Intent.ACTION_MY_PACKAGE_REPLACED) {
-            val storage = SecureStorage(context)
+            val storage = SecureStorage.get(context)
             when (val res = storage.readConfig()) {
                 is StorageResult.Success -> {
                     if (res.value.isStrictModeActive) {

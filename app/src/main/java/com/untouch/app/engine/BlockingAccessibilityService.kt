@@ -14,7 +14,7 @@ class BlockingAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        storage = SecureStorage(this)
+        storage = SecureStorage.get(this)
         val configResult = storage.readConfig()
         if (configResult is StorageResult.Success && configResult.value.isStrictModeActive) {
             ProtectionForegroundService.safeStart(this)
@@ -23,7 +23,9 @@ class BlockingAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            event.eventType != AccessibilityEvent.TYPE_WINDOWS_CHANGED
+        ) return
 
         val pkg = event.packageName?.toString() ?: return
         if (pkg == packageName || isProtectedSystemPackage(pkg)) return

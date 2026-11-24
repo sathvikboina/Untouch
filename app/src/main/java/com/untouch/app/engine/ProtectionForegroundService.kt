@@ -34,9 +34,10 @@ class ProtectionForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        storage = SecureStorage(this)
+        storage = SecureStorage.get(this)
         createNotificationChannels(this)
         startForeground(NOTIFICATION_ID_STATUS, buildStatusNotification("Strict Mode monitoring active"))
+        isRunning = true
         startMonitoringLoop()
     }
 
@@ -142,6 +143,7 @@ class ProtectionForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        isRunning = false
         scope.cancel()
         super.onDestroy()
     }
@@ -154,6 +156,11 @@ class ProtectionForegroundService : Service() {
         private const val NOTIFICATION_ID_STATUS = 1001
         private const val NOTIFICATION_ID_ALERT = 1002
         private const val ACTION_STOP = "com.untouch.app.ACTION_STOP_MONITOR"
+
+        /** True while the monitor service is actually alive in this process. */
+        @Volatile
+        var isRunning: Boolean = false
+            private set
 
         fun createNotificationChannels(context: Context) {
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager

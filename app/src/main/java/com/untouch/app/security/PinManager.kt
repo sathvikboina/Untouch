@@ -10,6 +10,7 @@ import javax.crypto.spec.PBEKeySpec
 
 sealed class PinVerificationResult {
     data object Success : PinVerificationResult()
+    data object NotConfigured : PinVerificationResult()
     data class Invalid(val remainingBeforeLockout: Int) : PinVerificationResult()
     data class LockedOut(val remainingSeconds: Long) : PinVerificationResult()
     data class StorageFailure(val reason: String) : PinVerificationResult()
@@ -61,11 +62,11 @@ class PinManager(private val storage: SecureStorage) {
 
         val saltB64 = when (val r = storage.readPinSalt()) {
             is StorageResult.Error -> return PinVerificationResult.StorageFailure(r.reason)
-            is StorageResult.Success -> r.value ?: return PinVerificationResult.Invalid(0)
+            is StorageResult.Success -> r.value ?: return PinVerificationResult.NotConfigured
         }
         val hashB64 = when (val r = storage.readPinHash()) {
             is StorageResult.Error -> return PinVerificationResult.StorageFailure(r.reason)
-            is StorageResult.Success -> r.value ?: return PinVerificationResult.Invalid(0)
+            is StorageResult.Success -> r.value ?: return PinVerificationResult.NotConfigured
         }
 
         val salt = Base64.decode(saltB64, Base64.NO_WRAP)

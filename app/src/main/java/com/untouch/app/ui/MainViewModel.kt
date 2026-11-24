@@ -2,7 +2,6 @@ package com.untouch.app.ui
 
 import android.app.Application
 import android.content.Intent
-import android.content.pm.ApplicationInfo
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.untouch.app.data.SecureStorage
@@ -13,11 +12,14 @@ import com.untouch.app.engine.ProtectionForegroundService
 import com.untouch.app.security.PinManager
 import com.untouch.app.security.PinVerificationResult
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class Screen {
     ONBOARDING,
@@ -60,13 +62,15 @@ data class MainUiState(
     val storageError: String? = null,
     val pendingAdminAction: AdminAction? = null,
     val authError: String? = null,
-    val lockoutSeconds: Long = 0L
+    val lockoutSeconds: Long = 0L,
+    val isAuthenticating: Boolean = false
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val storage = SecureStorage(application)
+    private val storage = SecureStorage.get(application)
     private val pinManager = PinManager(storage)
+    private var healthRefreshJob: Job? = null
 
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
@@ -76,7 +80,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         loadInstalledApps()
     }
 
-    fun reloadAllState(initialLoad: Boolean = false) {
+    fun reloadAllState(initialLoad: Boolean = false, allowMonitorStart: Boolean = true) {
         val perms = PermissionChecker.checkAll(getApplication())
         val configRes = storage.readConfig()
         val pinRes = pinManager.isPinConfigured()
@@ -108,10 +112,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val pinConfigured = (pinRes as StorageResult.Success).value
         val lockout = (pinManager.getRemainingLockoutSeconds() as? StorageResult.Success)?.value ?: 0L
 
+        // If Strict Mode is on but the health monitor died (process kill, OEM
+        // cleanup), try to restart it and re-check shortly afterwards.
+        if (allowMonitorStart && config.isStrictModeActive && !ProtectionForegroundService.isRunning) {
+            ProtectionForegroundService.safeStart(getApplication())
+            healthRefreshJob?.cancel()
+            healthRefreshJob = viewModelScope.launch {
+                delay(1200L)
+                reloadAllState(allowMonitorStart = false)
+            }
+        }
+
         val health = when {
             !config.isStrictModeActive -> ProtectionHealth.OFF
-            perms.coreProtectionReady -> ProtectionHealth.ACTIVE
-            else -> ProtectionHealth.DEGRADED
+            !perms.coreProtectionReady -> ProtectionHealth.DEGRADED
+            !ProtectionForegroundService.isRunning -> ProtectionHealth.DEGRADED
+            else -> ProtectionHealth.ACTIVE
         }
 
         val targetScreen = if (initialLoad) {
@@ -149,15 +165,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
             val resolved = pm.queryIntentActivities(launcherIntent, 0)
 
+            val protectedPackages = setOf(
+                myPkg,
+                // Never offer to block system-critical / emergency components.
+                "com.android.settings",
+                "com.android.systemui",
+                "com.android.phone",
+                "com.android.dialer",
+                "com.google.android.dialer",
+                "com.android.server.telecom",
+                "com.android.emergency",
+                "com.android.permissioncontroller",
+                "com.google.android.permissioncontroller",
+                "com.android.packageinstaller",
+                "com.google.android.packageinstaller"
+            )
+
             val apps = resolved
                 .map { it.activityInfo.applicationInfo }
                 .distinctBy { it.packageName }
-                .filter { info ->
-                    info.packageName != myPkg &&
-                        info.packageName != "com.android.settings" &&
-                        (info.flags and ApplicationInfo.FLAG_SYSTEM == 0 ||
-                            info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP != 0)
-                }
+                .filter { info -> info.packageName !in protectedPackages }
                 .map { info ->
                     InstalledApp(
                         appName = pm.getApplicationLabel(info).toString(),
@@ -188,16 +215,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun savePinAndFinishOnboarding(pin: String) {
-        when (val r1 = pinManager.setPin(pin)) {
-            is StorageResult.Error -> {
-                _uiState.update { it.copy(protectionHealth = ProtectionHealth.STORAGE_ERROR, storageError = r1.reason) }
-                return
+        if (_uiState.value.isAuthenticating) return
+        _uiState.update { it.copy(isAuthenticating = true) }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.Default) { pinManager.setPin(pin) }
+            _uiState.update { it.copy(isAuthenticating = false) }
+            when (result) {
+                is StorageResult.Error -> _uiState.update {
+                    it.copy(protectionHealth = ProtectionHealth.STORAGE_ERROR, storageError = result.reason)
+                }
+                is StorageResult.Success -> {
+                    storage.setOnboardingComplete(true)
+                    reloadAllState()
+                    navigateTo(Screen.PERMISSIONS)
+                }
             }
-            is StorageResult.Success -> Unit
         }
-        storage.setOnboardingComplete(true)
-        reloadAllState()
-        navigateTo(Screen.PERMISSIONS)
     }
 
     fun activateStrictMode() {
@@ -226,51 +259,63 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun submitAdminPin(pin: String) {
-        when (val result = pinManager.verifyPin(pin)) {
-            is PinVerificationResult.Success -> {
-                val action = _uiState.value.pendingAdminAction
-                when (action) {
-                    AdminAction.EDIT_BLOCKED_APPS -> {
-                        _uiState.update {
-                            it.copy(currentScreen = Screen.APP_SELECTION, pendingAdminAction = null, authError = null)
+        if (_uiState.value.isAuthenticating) return
+        _uiState.update { it.copy(isAuthenticating = true, authError = null) }
+        viewModelScope.launch {
+            // PBKDF2 (120k iterations) must never run on the main thread.
+            val result = withContext(Dispatchers.Default) { pinManager.verifyPin(pin) }
+            _uiState.update { it.copy(isAuthenticating = false) }
+            when (result) {
+                is PinVerificationResult.Success -> {
+                    val action = _uiState.value.pendingAdminAction
+                    when (action) {
+                        AdminAction.EDIT_BLOCKED_APPS -> {
+                            _uiState.update {
+                                it.copy(currentScreen = Screen.APP_SELECTION, pendingAdminAction = null, authError = null)
+                            }
                         }
-                    }
-                    AdminAction.DISABLE_STRICT_MODE -> {
-                        storage.setStrictModeActive(false)
-                        ProtectionForegroundService.stop(getApplication())
-                        reloadAllState()
-                        _uiState.update {
-                            it.copy(currentScreen = Screen.DASHBOARD, pendingAdminAction = null, authError = null)
+                        AdminAction.DISABLE_STRICT_MODE -> {
+                            storage.setStrictModeActive(false)
+                            ProtectionForegroundService.stop(getApplication())
+                            reloadAllState()
+                            _uiState.update {
+                                it.copy(currentScreen = Screen.DASHBOARD, pendingAdminAction = null, authError = null)
+                            }
                         }
-                    }
-                    AdminAction.OPEN_PERMISSIONS -> {
-                        _uiState.update {
-                            it.copy(currentScreen = Screen.PERMISSIONS, pendingAdminAction = null, authError = null)
+                        AdminAction.OPEN_PERMISSIONS -> {
+                            _uiState.update {
+                                it.copy(currentScreen = Screen.PERMISSIONS, pendingAdminAction = null, authError = null)
+                            }
                         }
+                        null -> navigateTo(Screen.DASHBOARD)
                     }
-                    null -> navigateTo(Screen.DASHBOARD)
                 }
-            }
-            is PinVerificationResult.Invalid -> {
-                _uiState.update {
-                    it.copy(authError = "Incorrect PIN. ${result.remainingBeforeLockout} attempt(s) before lockout.")
+                is PinVerificationResult.NotConfigured -> {
+                    _uiState.update {
+                        it.copy(authError = "No PIN is configured on this device.", pendingAdminAction = null)
+                    }
                 }
-            }
-            is PinVerificationResult.LockedOut -> {
-                _uiState.update {
-                    it.copy(
-                        lockoutSeconds = result.remainingSeconds,
-                        authError = "Too many failed attempts. Locked for ${result.remainingSeconds}s."
-                    )
+                is PinVerificationResult.Invalid -> {
+                    _uiState.update {
+                        it.copy(authError = "Incorrect PIN. ${result.remainingBeforeLockout} attempt(s) before lockout.")
+                    }
                 }
-            }
-            is PinVerificationResult.StorageFailure -> {
-                _uiState.update {
-                    it.copy(
-                        protectionHealth = ProtectionHealth.STORAGE_ERROR,
-                        storageError = result.reason,
-                        currentScreen = Screen.DASHBOARD
-                    )
+                is PinVerificationResult.LockedOut -> {
+                    _uiState.update {
+                        it.copy(
+                            lockoutSeconds = result.remainingSeconds,
+                            authError = "Too many failed attempts. Locked for ${result.remainingSeconds}s."
+                        )
+                    }
+                }
+                is PinVerificationResult.StorageFailure -> {
+                    _uiState.update {
+                        it.copy(
+                            protectionHealth = ProtectionHealth.STORAGE_ERROR,
+                            storageError = result.reason,
+                            currentScreen = Screen.DASHBOARD
+                        )
+                    }
                 }
             }
         }
